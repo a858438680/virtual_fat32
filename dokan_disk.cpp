@@ -54,7 +54,7 @@ std::string wide2local(const wchar_t *s)
 dev_io::dev_t &get_dev()
 {
     static dev_io::dev_t dev("test.img");
-    if (dev)
+    if (!dev)
     {
         log_msg("open disk error");
         exit(EXIT_FAILURE);

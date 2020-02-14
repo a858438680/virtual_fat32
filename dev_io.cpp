@@ -257,11 +257,13 @@ int32_t dev_t::write_block(uint32_t block_no, const void *buf) const
 
 int32_t dev_t::read_clus(uint32_t clus_no, void *buf) const
 {
+    clus_no -= 2;
     return dev_read(dev_img, (data_begin + get_sec_per_clus() * clus_no) * get_block_size(), get_sec_per_clus() * get_block_size(), buf);
 }
 
 int32_t dev_t::write_clus(uint32_t clus_no, const void *buf) const
 {
+    clus_no -= 2;
     return dev_write(dev_img, (data_begin + get_sec_per_clus() * clus_no) * get_block_size(), get_sec_per_clus() * get_block_size(), buf);
 }
 
