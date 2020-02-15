@@ -1,10 +1,11 @@
-#include "dev_io.h"
-#include <Windows.h>
 #include <mutex>
-#include <stdlib.h>
+#include <vector>
 #include <string>
 #include <utility>
-#include <vector>
+#include <stdlib.h>
+#include <time.h>
+#include <windows.h>
+#include "dev_io.h"
 
 std::mutex m;
 
@@ -82,7 +83,14 @@ void set_BPB(uint32_t tot_block, uint16_t block_size, fat32::BPB_t *pBPB)
     pBPB->BPB_BkBootSec = 6;
     pBPB->BS_DrvNum = 0x80;
     pBPB->BS_BootSig = 0x29;
-    pBPB->BS_VolID = time(NULL);
+    auto t = time(NULL);
+    auto pt = localtime(&t);
+    pBPB->BS_VolID = ((uint32_t)(pt->tm_yday - 80) << 25) +
+                     ((uint32_t)(pt->tm_mon + 1) << 21) +
+                     ((uint32_t)(pt->tm_mday + 1) << 16) +
+                     ((uint32_t)(pt->tm_hour) << 11) +
+                     ((uint32_t)(pt->tm_min) << 5) +
+                     ((uint32_t)(pt->tm_sec / 2));
     strcpy(pBPB->BS_VolLab, "NO NAME");
     strcpy(pBPB->BS_FilSysType, "FAT32");
     pBPB->Signature_word = 0xAA55;
@@ -93,9 +101,9 @@ void set_FSInfo(fat32::FSInfo_t *pFSInfo, fat32::BPB_t *pBPB)
     memset(pFSInfo, 0, sizeof(fat32::FSInfo_t));
     pFSInfo->FSI_LeadSig = 0x41615252;
     pFSInfo->FSI_StrucSig = 0x61417272;
-    pFSInfo->FSI_Nxt_Free = 2;
+    pFSInfo->FSI_Nxt_Free = 3;
     uint32_t data_begin = pBPB->BPB_FATSz32 * pBPB->BPB_NumFATs + pBPB->BPB_RsvdSecCnt;
-    pFSInfo->FSI_FreeCount = (pBPB->BPB_TotSec32 - data_begin) / pBPB->BPB_SecPerClus;
+    pFSInfo->FSI_FreeCount = (pBPB->BPB_TotSec32 - data_begin) / pBPB->BPB_SecPerClus - 1;
     pFSInfo->FSI_TrailSig = 0xAA550000;
 }
 
@@ -210,6 +218,11 @@ uint16_t dev_t::get_block_size() const noexcept
     return BPB.BPB_BytsPerSec;
 }
 
+uint32_t dev_t::get_clus_size() const noexcept
+{
+    return clus_size;
+}
+
 uint32_t dev_t::get_count_of_clus() const noexcept
 {
     return count_of_cluster;
@@ -237,12 +250,12 @@ uint32_t dev_t::get_vol_id() const noexcept
 
 uint32_t dev_t::get_fat(uint32_t fat_no) const
 {
-    return FAT_Table[fat_no & 0x7fffffff];
+    return FAT_Table[fat_no & 0x0fffffff];
 }
 
 void dev_t::set_fat(uint32_t fat_no, uint32_t value)
 {
-    FAT_Table[fat_no & 0x7fffffff] = (value & 0x7fffffff);
+    FAT_Table[fat_no & 0x0fffffff] = (value & 0x0fffffff);
 }
 
 int32_t dev_t::read_block(uint32_t block_no, void *buf) const
@@ -334,6 +347,7 @@ void dev_t::clac_info()
     }
     data_begin = BPB.BPB_RsvdSecCnt + BPB.BPB_NumFATs * BPB.BPB_FATSz32;
     count_of_cluster = (BPB.BPB_TotSec32 - data_begin) / BPB.BPB_SecPerClus;
+    clus_size = BPB.BPB_BytsPerSec * BPB.BPB_SecPerClus;
 }
 
 } // namespace dev_io
