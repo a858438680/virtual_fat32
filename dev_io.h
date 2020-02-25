@@ -1,5 +1,7 @@
 #ifndef DEV_IO_H
 #define DEV_IO_H
+#include <mutex>
+#include <map>
 #include <stdexcept>
 #include <stdint.h>
 #include "fat32.h"
@@ -49,51 +51,69 @@ class dev_t
 public:
     dev_t(const char *dev_name, uint32_t tot_block, uint16_t block_size);
     dev_t(const char *dev_name);
-    dev_t(dev_t &&dev) noexcept;
+    dev_t(dev_t &&dev) = delete;
     dev_t(const dev_t &dev) = delete;
-    dev_t &operator=(dev_t &&dev) noexcept;
+    dev_t &operator=(dev_t &&dev) = delete;
     dev_t &operator=(const dev_t &dev) = delete;
     ~dev_t();
 
     operator bool() const noexcept;
 
-    uint16_t get_block_size() const noexcept;
-    uint32_t get_count_of_clus() const noexcept;
-    uint32_t get_clus_size() const noexcept;
+    uint64_t open(const fat32::path &path, uint32_t create_disposition, uint32_t file_attr, bool &exist, bool &isdir);
+    uint64_t unlink(const fat32::path &path);
+    void stat(const fat32::path &path, LPBY_HANDLE_FILE_INFORMATION statbuf);
+    void rename(const fat32::path &oldpath, const fat32::path &newpath);
+    void mkdir(const fat32::path &path);
+    void rmdir(const fat32::path &path);
+    fat32::dir_info opendir(const fat32::path &path);
+    void close(uint64_t fd);
+    uint32_t read(uint64_t fd, int64_t offset, uint32_t len, void *buf);
+    uint32_t write(uint64_t fd, int64_t offset, uint32_t len, const void *buf);
+    void fstat(uint64_t fd, LPBY_HANDLE_FILE_INFORMATION statbuf);
+    fat32::dir_info opendir(uint64_t fd);
+    void flush();
+    void clear();
+
     uint32_t get_root_clus() const noexcept;
-    uint8_t get_sec_per_clus() const noexcept;
-    uint32_t get_total_block() const noexcept;
     uint32_t get_vol_id() const noexcept;
     uint32_t get_fat(uint32_t fat_no) const;
     void set_fat(uint32_t fat_no, uint32_t value);
 
+private:
+    static int32_t dev_read(void *handle, uint64_t offset, uint32_t size, void *buf);
+    static int32_t dev_write(void *handle, uint64_t offset, uint32_t size, const void *buf);
     int32_t read_block(uint32_t block_no, void *buf) const;
     int32_t write_block(uint32_t block_no, const void *buf) const;
     int32_t read_clus(uint32_t clus_no, void *buf) const;
     int32_t write_clus(uint32_t clus_no, const void *buf) const;
-
-    void get_info(const fat32::path &path, void *buffer);
-    fat32::file open_file(const fat32::path &path);
-    fat32::dir_info open_dir(const fat32::path &path);
-
-private:
-    static int32_t dev_read(void *handle, uint64_t offset, uint32_t size, void *buf);
-    static int32_t dev_write(void *handle, uint64_t offset, uint32_t size, const void *buf);
     void format(uint32_t tot_block, uint16_t block_size);
     void clac_info();
 
-    fat32::file_alloc open_file(uint32_t clus_no);
-    fat32::dir_info open_dir(uint32_t clus_no);
-    uint32_t get_first_clus(const fat32::path &path, int *isdir = nullptr);
+    std::unique_ptr<fat32::file_node> open_file(fat32::file_node *parent, fat32::Entry_Info *pinfo);
+    void save(fat32::file_node *node);
+    void clear_node(fat32::file_node *node);
+    uint32_t next_free();
+    void free_clus(uint32_t clus_no);
+    void extend(fat32::file_node *node, uint32_t clus_count);
+    void shrink(fat32::file_node *node, uint32_t clus_count);
+    void add_entry(fat32::file_node *node, fat32::Entry_Info *pinfo);
+    void remove_entry(fat32::file_node *node, std::wstring_view name);
+    int32_t DirEntry2EntryInfo(fat32::DIR_Entry *pdir, fat32::Entry_Info *pinfo);
 
     void *dev_img;
     fat32::BPB_t BPB;
-    fat32::BPB_t BPB_Backup;
     fat32::FSInfo_t FSInfo;
     std::vector<uint32_t> FAT_Table;
+    std::set<uint64_t> open_file_table;
+    std::unique_ptr<fat32::file_node> root;
+    uint32_t tot_block;
+    uint16_t block_size;
+    uint8_t sec_per_clus;
+    uint32_t clus_size;
     uint32_t data_begin;
     uint32_t count_of_cluster;
-    uint32_t clus_size;
+    fat32::Entry_Info root_info;
+    bool cleared;
 };
 
 } // namespace dev_io

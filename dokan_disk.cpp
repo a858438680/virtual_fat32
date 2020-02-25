@@ -13,16 +13,14 @@
 #include "dokan_log.h"
 #include "dev_io.h"
 
-std::map<uint64_t, fat32::file> open_file_table;
-uint64_t last_index;
-std::mutex mtx;
+std::mutex global_mtx;
 
-std::vector<std::wstring> parse_path(LPCWSTR FileName)
+std::vector<std::wstring> parse_path(LPCWSTR FileName, bool *ads = nullptr)
 {
     std::vector<std::wstring> res;
     wchar_t buf[256];
     int index = 0;
-    while (*FileName != L'\0')
+    while (*FileName != L'\0' && *FileName != L':')
     {
         if (*FileName == L'\\')
         {
@@ -39,16 +37,11 @@ std::vector<std::wstring> parse_path(LPCWSTR FileName)
         }
         ++FileName;
     }
+    if (*FileName == L':' && ads)
+    {
+        *ads = true;
+    }
     return res;
-}
-
-std::string wide2local(const wchar_t *s)
-{
-    int size = WideCharToMultiByte(CP_ACP, 0, s, -1, NULL, 0, NULL, FALSE);
-    std::string res;
-    res.resize(size);
-    size = WideCharToMultiByte(CP_ACP, 0, s, -1, res.data(), size, NULL, FALSE);
-    return std::move(res);
 }
 
 dev_io::dev_t &get_dev()
@@ -71,43 +64,78 @@ NTSTATUS DOKAN_CALLBACK VFATZwCreateFile(LPCWSTR FileName,
                                          ULONG CreateOptions,
                                          PDOKAN_FILE_INFO DokanFileInfo)
 {
-    log_msg("ZwCreateFile:\n"
-            "    FileName: %s\n",
-            wide2local(FileName).c_str());
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_ZwCreateFile();
     try
     {
-        auto file = get_dev().open_file(parse_path(FileName));
+        bool exist;
         bool isdir;
-        uint64_t index = last_index;
+        bool ads = false;
+        auto path = parse_path(FileName, &ads);
+        if (ads)
         {
-            std::lock_guard<std::mutex> g(mtx);
-            while (open_file_table.find(index) != open_file_table.end())
-                ++index;
-            open_file_table.insert(std::make_pair(index, std::move(file)));
-            last_index = index + 1;
-            isdir = file.isdir();
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_OBJECT_NAME_INVALID);
         }
-        DokanFileInfo->Context = index;
+        ACCESS_MASK genericDesiredAccess;
+        DWORD fileAttributesAndFlags;
+        DWORD creationDisposition;
+        DokanMapKernelToUserCreateFileFlags(
+            DesiredAccess, FileAttributes, CreateOptions, CreateDisposition,
+            &genericDesiredAccess, &fileAttributesAndFlags, &creationDisposition);
+        log_uint32("    ", creationDisposition);
+        auto file = get_dev().open(parse_path(FileName), creationDisposition, FileAttributes, exist, isdir);
+        if (isdir && (CreateOptions & FILE_NON_DIRECTORY_FILE))
+        {
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_FILE_IS_A_DIRECTORY);
+        }
+        if (!isdir && (CreateOptions & FILE_DIRECTORY_FILE))
+        {
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_NOT_A_DIRECTORY);
+        }
+        DokanFileInfo->Context = file;
         DokanFileInfo->IsDirectory = isdir;
+        if ((CreateDisposition == CREATE_ALWAYS || CreateDisposition == OPEN_ALWAYS) && exist)
+        {
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_OBJECT_NAME_COLLISION);
+        }
     }
     catch (fat32::file_error &e)
     {
         switch (e.get_error_type())
         {
         case fat32::file_error::FILE_NOT_FOUND:
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_OBJECT_NAME_NOT_FOUND);
 
-        default:
-            return STATUS_OBJECT_NAME_NOT_FOUND;
+        case fat32::file_error::FILE_NOT_DIR:
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_NOT_A_DIRECTORY);
+
+        case fat32::file_error::FILE_ALREADY_EXISTS:
+            log_pdokan_file_info("", DokanFileInfo);
+            LOG_RETURN(ZwCreateFile, STATUS_OBJECT_NAME_COLLISION);
         }
     }
-    return STATUS_SUCCESS;
+    log_pdokan_file_info("", DokanFileInfo);
+    LOG_RETURN(ZwCreateFile, STATUS_SUCCESS);
 }
 
 void DOKAN_CALLBACK VFATCleanup(LPCWSTR FileName,
                                 PDOKAN_FILE_INFO DokanFileInfo)
 {
-    open_file_table.erase(DokanFileInfo->Context);
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_CleanUp();
+    try
+    {
+        get_dev().close(DokanFileInfo->Context);
+    }
+    catch (fat32::file_error &e)
+    {
+    }
 }
 
 void DOKAN_CALLBACK VFATCloseFile(LPCWSTR FileName,
@@ -123,48 +151,64 @@ NTSTATUS DOKAN_CALLBACK VFATReadFile(LPCWSTR FileName,
                                      LONGLONG Offset,
                                      PDOKAN_FILE_INFO DokanFileInfo)
 {
-    auto &dev = get_dev();
-    decltype(open_file_table.begin()) itr;
-    if ((itr = open_file_table.find(DokanFileInfo->Context)) != open_file_table.end())
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_ReadFile();
+    try
     {
-        auto &file = itr->second;
-        ULARGE_INTEGER tmp;
-        tmp.HighPart = file.info.nFileSizeHigh;
-        tmp.LowPart = file.info.nFileSizeLow;
-        uint64_t file_size = tmp.QuadPart;
-        int64_t left_border = Offset > 0 ? Offset : 0;
-        int64_t right_border = (Offset + BufferLength) < file_size ? (Offset + BufferLength) : file_size;
-        if (left_border >= right_border)
-        {
-            *ReadLength = 0;
-            return STATUS_SUCCESS;
-        }
-        auto clus_size = dev.get_clus_size();
-        std::vector<char> buf(clus_size);
-        uint32_t begin_clus = left_border / clus_size;
-        uint32_t end_clus = (right_border + clus_size - 1) / clus_size;
-        uint32_t index = 0;
-        for (auto i = begin_clus; i < end_clus; ++i)
-        {
-            dev.read_clus(file.alloc[i], buf.data());
-            uint32_t begin = 0, end = clus_size;
-            if (i == begin_clus)
-            {
-                begin = left_border % clus_size;
-            }
-            if (i == end_clus)
-            {
-                end = (right_border - 1) % clus_size + 1;
-            }
-            auto size = end - begin;
-            memcpy((char*)Buffer + index, buf.data() + begin, size);
-            index += size;
-        }
-        *ReadLength = index;
-        return STATUS_SUCCESS;
+        *ReadLength = get_dev().read(DokanFileInfo->Context, Offset, BufferLength, Buffer);
+        log_uint32("", *ReadLength);
+        LOG_RETURN(ReadFile, STATUS_SUCCESS);
     }
-    *ReadLength = 0;
-    return STATUS_SUCCESS;
+    catch (fat32::file_error &e)
+    {
+        switch (e.get_error_type())
+        {
+        case fat32::file_error::FILE_NOT_FOUND:
+            log_uint32("", *ReadLength);
+            LOG_RETURN(ReadFile, STATUS_OBJECT_NAME_NOT_FOUND);
+
+        case fat32::file_error::FILE_NOT_DIR:
+            log_uint32("", *ReadLength);
+            LOG_RETURN(ReadFile, STATUS_NOT_A_DIRECTORY);
+
+        case fat32::file_error::FILE_ALREADY_EXISTS:
+            log_uint32("", *ReadLength);
+            LOG_RETURN(ReadFile, STATUS_OBJECT_NAME_COLLISION);
+
+        default:
+            try
+            {
+                bool exist;
+                bool isdir;
+                auto file = get_dev().open(parse_path(FileName), OPEN_EXISTING, 0, exist, isdir);
+                DokanFileInfo->Context = file;
+                DokanFileInfo->IsDirectory = isdir;
+                *ReadLength = get_dev().read(DokanFileInfo->Context, Offset, BufferLength, Buffer);
+                return STATUS_SUCCESS;
+            }
+            catch (fat32::file_error &e2)
+            {
+                switch (e2.get_error_type())
+                {
+                case fat32::file_error::FILE_NOT_FOUND:
+                    log_uint32("", *ReadLength);
+                    LOG_RETURN(ReadFile, STATUS_OBJECT_NAME_NOT_FOUND);
+
+                case fat32::file_error::FILE_NOT_DIR:
+                    log_uint32("", *ReadLength);
+                    LOG_RETURN(ReadFile, STATUS_NOT_A_DIRECTORY);
+
+                case fat32::file_error::FILE_ALREADY_EXISTS:
+                    log_uint32("", *ReadLength);
+                    LOG_RETURN(ReadFile, STATUS_OBJECT_NAME_COLLISION);
+
+                default:
+                    log_msg("ReadFile invalid file discriptor\n");
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+    }
 }
 
 NTSTATUS DOKAN_CALLBACK VFATWriteFile(LPCWSTR FileName,
@@ -174,65 +218,132 @@ NTSTATUS DOKAN_CALLBACK VFATWriteFile(LPCWSTR FileName,
                                       LONGLONG Offset,
                                       PDOKAN_FILE_INFO DokanFileInfo)
 {
-    auto &dev = get_dev();
-    decltype(open_file_table.begin()) itr;
-    if ((itr = open_file_table.find(DokanFileInfo->Context)) != open_file_table.end())
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_WriteFile();
+    try
     {
-        if (!NumberOfBytesToWrite)
-        {
-            *NumberOfBytesWritten = 0;
-            return STATUS_SUCCESS;
-        }
-        auto &file = itr->second;
-        ULARGE_INTEGER tmp;
-        tmp.HighPart = file.info.nFileSizeHigh;
-        tmp.LowPart = file.info.nFileSizeLow;
-        uint64_t file_size = tmp.QuadPart;
-        uint64_t left_border = DokanFileInfo->WriteToEndOfFile ? file_size : (Offset > 0 ? Offset : 0);
-        uint64_t right_border = left_border + NumberOfBytesToWrite;
-        auto clus_size = dev.get_clus_size();
-        std::vector<char> buf(clus_size);
-        uint32_t begin_clus = left_border / clus_size;
-        uint32_t end_clus = (right_border + clus_size - 1) / clus_size;
-        for (auto i = begin_clus; i < end_clus; ++i)
-        {
-            
-        }
-        return STATUS_SUCCESS;
+        BY_HANDLE_FILE_INFORMATION info;
+        get_dev().fstat(DokanFileInfo->Context, &info);
+        *NumberOfBytesWritten = get_dev().write(DokanFileInfo->Context, DokanFileInfo->WriteToEndOfFile ? info.nFileSizeLow : Offset, NumberOfBytesToWrite, Buffer);
+        log_uint32("", *NumberOfBytesWritten);
+        LOG_RETURN(WriteFile, STATUS_SUCCESS);
     }
-    return STATUS_SUCCESS;
+    catch (fat32::file_error &e)
+    {
+        switch (e.get_error_type())
+        {
+        case fat32::file_error::FILE_NOT_FOUND:
+            log_uint32("", *NumberOfBytesWritten);
+            LOG_RETURN(WriteFile, STATUS_OBJECT_NAME_NOT_FOUND);
+
+        case fat32::file_error::FILE_NOT_DIR:
+            log_uint32("", *NumberOfBytesWritten);
+            LOG_RETURN(WriteFile, STATUS_NOT_A_DIRECTORY);
+
+        case fat32::file_error::FILE_ALREADY_EXISTS:
+            log_uint32("", *NumberOfBytesWritten);
+            LOG_RETURN(WriteFile, STATUS_OBJECT_NAME_COLLISION);
+
+        default:
+            try
+            {
+                bool exist;
+                bool isdir;
+                auto file = get_dev().open(parse_path(FileName), OPEN_EXISTING, 0, exist, isdir);
+                DokanFileInfo->Context = file;
+                DokanFileInfo->IsDirectory = isdir;
+                BY_HANDLE_FILE_INFORMATION info;
+                get_dev().fstat(DokanFileInfo->Context, &info);
+                *NumberOfBytesWritten = get_dev().write(DokanFileInfo->Context, DokanFileInfo->WriteToEndOfFile ? info.nFileSizeLow : Offset, NumberOfBytesToWrite, Buffer);
+                return STATUS_SUCCESS;
+            }
+            catch (fat32::file_error &e2)
+            {
+                switch (e2.get_error_type())
+                {
+                case fat32::file_error::FILE_NOT_FOUND:
+                    log_uint32("", *NumberOfBytesWritten);
+                    LOG_RETURN(WriteFile, STATUS_OBJECT_NAME_NOT_FOUND);
+
+                case fat32::file_error::FILE_NOT_DIR:
+                    log_uint32("", *NumberOfBytesWritten);
+                    LOG_RETURN(WriteFile, STATUS_NOT_A_DIRECTORY);
+
+                case fat32::file_error::FILE_ALREADY_EXISTS:
+                    log_uint32("", *NumberOfBytesWritten);
+                    LOG_RETURN(WriteFile, STATUS_OBJECT_NAME_COLLISION);
+
+                default:
+                    log_msg("WriteFile invalid file discriptor\n");
+                    exit(EXIT_FAILURE);
+                }
+            }
+        }
+    }
 }
 
 NTSTATUS DOKAN_CALLBACK VFATGetFileInformation(LPCWSTR FileName,
                                                LPBY_HANDLE_FILE_INFORMATION Buffer,
                                                PDOKAN_FILE_INFO DokanFileInfo)
 {
-    log_msg("GetFileInformation:\nFileName: %s\n", wide2local(FileName).c_str());
-    decltype(open_file_table.begin()) itr;
-    if ((itr = open_file_table.find(DokanFileInfo->Context)) != open_file_table.end())
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_GetFileInformation();
+    try
     {
-        memcpy(Buffer, &itr->second.info, sizeof(BY_HANDLE_FILE_INFORMATION));
-        return STATUS_SUCCESS;
+        get_dev().fstat(DokanFileInfo->Context, Buffer);
+        log_lpby_handle_information("", Buffer);
+        LOG_RETURN(GetFileInformation, STATUS_SUCCESS);
     }
-    else
+    catch (fat32::file_error &e)
     {
-        auto path = parse_path(FileName);
-        try
+        switch (e.get_error_type())
         {
-            get_dev().get_info(path, Buffer);
-        }
-        catch (fat32::file_error &e)
-        {
-            switch (e.get_error_type())
-            {
-            case fat32::file_error::FILE_NOT_FOUND:
-                return STATUS_OBJECT_NAME_NOT_FOUND;
+        case fat32::file_error::FILE_NOT_FOUND:
+            log_lpby_handle_information("", Buffer);
+            LOG_RETURN(GetFileInformation, STATUS_OBJECT_NAME_NOT_FOUND);
 
-            default:
-                return STATUS_OBJECT_NAME_NOT_FOUND;
+        case fat32::file_error::FILE_NOT_DIR:
+            log_lpby_handle_information("", Buffer);
+            LOG_RETURN(GetFileInformation, STATUS_NOT_A_DIRECTORY);
+
+        case fat32::file_error::FILE_ALREADY_EXISTS:
+            log_lpby_handle_information("", Buffer);
+            LOG_RETURN(GetFileInformation, STATUS_OBJECT_NAME_COLLISION);
+
+        default:
+            try
+            {
+                bool exist;
+                bool isdir;
+                auto file = get_dev().open(parse_path(FileName), OPEN_EXISTING, 0, exist, isdir);
+                DokanFileInfo->Context = file;
+                DokanFileInfo->IsDirectory = isdir;
+                get_dev().fstat(DokanFileInfo->Context, Buffer);
+                log_lpby_handle_information("", Buffer);
+                LOG_RETURN(GetFileInformation, STATUS_SUCCESS);
+            }
+            catch (fat32::file_error &e2)
+            {
+                switch (e2.get_error_type())
+                {
+                case fat32::file_error::FILE_NOT_FOUND:
+                    log_lpby_handle_information("", Buffer);
+                    LOG_RETURN(GetFileInformation, STATUS_OBJECT_NAME_NOT_FOUND);
+
+                case fat32::file_error::FILE_NOT_DIR:
+                    log_lpby_handle_information("", Buffer);
+                    LOG_RETURN(GetFileInformation, STATUS_NOT_A_DIRECTORY);
+
+                case fat32::file_error::FILE_ALREADY_EXISTS:
+                    log_lpby_handle_information("", Buffer);
+                    LOG_RETURN(GetFileInformation, STATUS_OBJECT_NAME_COLLISION);
+
+                default:
+                    log_msg("GetFileInformation invalid file discriptor\n");
+                    exit(EXIT_FAILURE);
+                }
             }
         }
-        return STATUS_SUCCESS;
     }
 }
 
@@ -240,13 +351,13 @@ NTSTATUS DOKAN_CALLBACK VFATFindFiles(LPCWSTR FileName,
                                       PFillFindData FillFindData,
                                       PDOKAN_FILE_INFO DokanFileInfo)
 {
-    log_msg("FindFiles:\nFileName: %s\n", wide2local(FileName).c_str());
+    std::lock_guard<std::mutex> g(global_mtx);
+    LOG_FindFiles();
     WIN32_FIND_DATAW findData;
-
-    decltype(open_file_table.begin()) itr;
-    if ((itr = open_file_table.find(DokanFileInfo->Context)) != open_file_table.end())
+    try
     {
-        for (const auto &entry : itr->second.entries)
+        auto ret = get_dev().opendir(DokanFileInfo->Context);
+        for (const auto &entry : ret)
         {
             memset(&findData, 0, sizeof(WIN32_FIND_DATAW));
             wcsncpy(findData.cFileName, entry.name, MAX_PATH - 1);
@@ -258,40 +369,63 @@ NTSTATUS DOKAN_CALLBACK VFATFindFiles(LPCWSTR FileName,
             findData.nFileSizeLow = entry.info.nFileSizeLow;
             FillFindData(&findData, DokanFileInfo);
         }
-        return STATUS_SUCCESS;
+        LOG_RETURN(FindFiles, STATUS_SUCCESS);
     }
-    else
+    catch (fat32::file_error &e)
     {
-        auto path = parse_path(FileName);
-        try
+        switch (e.get_error_type())
         {
-            auto dir = get_dev().open_dir(path);
-            for (const auto &entry : dir)
+        case fat32::file_error::FILE_NOT_FOUND:
+            LOG_RETURN(FindFiles, STATUS_OBJECT_NAME_NOT_FOUND);
+
+        case fat32::file_error::FILE_NOT_DIR:
+            LOG_RETURN(FindFiles, STATUS_NOT_A_DIRECTORY);
+
+        case fat32::file_error::FILE_ALREADY_EXISTS:
+            LOG_RETURN(FindFiles, STATUS_OBJECT_NAME_COLLISION);
+
+        default:
+            try
             {
-                memset(&findData, 0, sizeof(WIN32_FIND_DATAW));
-                wcsncpy(findData.cFileName, entry.name, MAX_PATH - 1);
-                findData.dwFileAttributes = entry.info.dwFileAttributes;
-                findData.ftCreationTime = entry.info.ftCreationTime;
-                findData.ftLastAccessTime = entry.info.ftLastWriteTime;
-                findData.ftLastWriteTime = entry.info.ftLastWriteTime;
-                findData.nFileSizeHigh = entry.info.nFileSizeHigh;
-                findData.nFileSizeLow = entry.info.nFileSizeLow;
-                FillFindData(&findData, DokanFileInfo);
+                bool exist;
+                bool isdir;
+                auto file = get_dev().open(parse_path(FileName), OPEN_EXISTING, 0, exist, isdir);
+                DokanFileInfo->Context = file;
+                DokanFileInfo->IsDirectory = isdir;
+                auto ret = get_dev().opendir(DokanFileInfo->Context);
+                for (const auto &entry : ret)
+                {
+                    memset(&findData, 0, sizeof(WIN32_FIND_DATAW));
+                    wcsncpy(findData.cFileName, entry.name, MAX_PATH - 1);
+                    findData.dwFileAttributes = entry.info.dwFileAttributes;
+                    findData.ftCreationTime = entry.info.ftCreationTime;
+                    findData.ftLastAccessTime = entry.info.ftLastWriteTime;
+                    findData.ftLastWriteTime = entry.info.ftLastWriteTime;
+                    findData.nFileSizeHigh = entry.info.nFileSizeHigh;
+                    findData.nFileSizeLow = entry.info.nFileSizeLow;
+                    FillFindData(&findData, DokanFileInfo);
+                }
+                LOG_RETURN(FindFiles, STATUS_SUCCESS);
+            }
+            catch (fat32::file_error &e2)
+            {
+                switch (e2.get_error_type())
+                {
+                case fat32::file_error::FILE_NOT_FOUND:
+                    return STATUS_OBJECT_NAME_NOT_FOUND;
+
+                case fat32::file_error::FILE_NOT_DIR:
+                    return STATUS_NOT_A_DIRECTORY;
+
+                case fat32::file_error::FILE_ALREADY_EXISTS:
+                    return STATUS_OBJECT_NAME_COLLISION;
+
+                default:
+                    log_msg("FindFiles invalid file discriptor\n");
+                    exit(EXIT_FAILURE);
+                }
             }
         }
-        catch (const fat32::file_error &e)
-        {
-            switch (e.get_error_type())
-            {
-            case fat32::file_error::FILE_NOT_FOUND:
-                return STATUS_OBJECT_NAME_NOT_FOUND;
-
-            case fat32::file_error::FILE_NOT_DIR:
-                return STATUS_NOT_A_DIRECTORY;
-            }
-        }
-
-        return STATUS_SUCCESS;
     }
 }
 
@@ -303,6 +437,13 @@ NTSTATUS DOKAN_CALLBACK VFATFindFilesWithPattern(LPCWSTR PathName,
     return STATUS_NOT_IMPLEMENTED;
 }
 
+NTSTATUS DOKAN_CALLBACK VFATUnmounted(PDOKAN_FILE_INFO DokanFileInfo)
+{
+    std::lock_guard<std::mutex> g(global_mtx);
+    get_dev().clear();
+    return STATUS_SUCCESS;
+}
+
 DOKAN_OPERATIONS operations = {
     .ZwCreateFile = VFATZwCreateFile,
     .Cleanup = VFATCleanup,
@@ -312,6 +453,7 @@ DOKAN_OPERATIONS operations = {
     .GetFileInformation = VFATGetFileInformation,
     .FindFiles = VFATFindFiles,
     .FindFilesWithPattern = VFATFindFilesWithPattern,
+    .Unmounted = VFATUnmounted,
 };
 
 DOKAN_OPTIONS dokanOptions = {

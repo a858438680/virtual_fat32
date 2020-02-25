@@ -108,14 +108,16 @@ void set_FSInfo(fat32::FSInfo_t *pFSInfo, fat32::BPB_t *pBPB)
 }
 
 dev_t::dev_t(const char *dev_name, uint32_t tot_block, uint16_t block_size)
-    : dev_img(INVALID_HANDLE_VALUE)
+    : dev_img(INVALID_HANDLE_VALUE), cleared(true)
 {
     try
     {
         auto wdev_name = local2wide(dev_name);
-        dev_img = CreateFileW(wdev_name.c_str(), GENERIC_READ | GENERIC_WRITE,
+        dev_img = CreateFileW(wdev_name.c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
                               FILE_SHARE_READ, NULL, CREATE_NEW,
-                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, NULL);
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+                              NULL);
         if (dev_img == INVALID_HANDLE_VALUE)
             throw disk_error(disk_error::DISK_OPEN_ERROR);
         LARGE_INTEGER file_size;
@@ -125,7 +127,6 @@ dev_t::dev_t(const char *dev_name, uint32_t tot_block, uint16_t block_size)
         if (!SetEndOfFile(dev_img))
             throw disk_error(disk_error::DISK_EXTEND_ERROR);
         format(tot_block, block_size);
-        clac_info();
     }
     catch (disk_error &e)
     {
@@ -135,14 +136,17 @@ dev_t::dev_t(const char *dev_name, uint32_t tot_block, uint16_t block_size)
     }
 }
 
-dev_t::dev_t(const char *dev_name) : dev_img(INVALID_HANDLE_VALUE)
+dev_t::dev_t(const char *dev_name)
+    : dev_img(INVALID_HANDLE_VALUE), cleared(true)
 {
     try
     {
         auto wdev_name = local2wide(dev_name);
-        dev_img = CreateFileW(wdev_name.c_str(), GENERIC_READ | GENERIC_WRITE,
+        dev_img = CreateFileW(wdev_name.c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
                               FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING, NULL);
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+                              NULL);
         if (dev_img == INVALID_HANDLE_VALUE)
         {
             if (GetLastError() == ERROR_FILE_NOT_FOUND)
@@ -150,9 +154,6 @@ dev_t::dev_t(const char *dev_name) : dev_img(INVALID_HANDLE_VALUE)
             else
                 throw disk_error(disk_error::DISK_OPEN_ERROR);
         }
-        LARGE_INTEGER file_size;
-        if (!GetFileSizeEx(dev_img, &file_size))
-            throw disk_error(disk_error::DISK_GET_SIZE_ERROR);
         dev_read(dev_img, 0, sizeof(fat32::BPB_t), &BPB);
         if (BPB.Signature_word != 0xaa55)
         {
@@ -174,36 +175,11 @@ dev_t::dev_t(const char *dev_name) : dev_img(INVALID_HANDLE_VALUE)
     }
 }
 
-dev_t::dev_t(dev_t &&dev) noexcept
-    : dev_img(dev.dev_img), BPB(dev.BPB), BPB_Backup(dev.BPB_Backup),
-      FSInfo(dev.FSInfo), FAT_Table(std::move(FAT_Table)),
-      data_begin(dev.data_begin), count_of_cluster(dev.count_of_cluster)
-{
-    dev.dev_img = INVALID_HANDLE_VALUE;
-}
-
-dev_t &dev_t::operator=(dev_t &&dev) noexcept
-{
-    auto tmp = dev_img;
-    dev_img = dev.dev_img;
-    BPB = dev.BPB;
-    BPB_Backup = dev.BPB_Backup;
-    FSInfo = dev.FSInfo;
-    FAT_Table = std::move(dev.FAT_Table);
-    data_begin = dev.data_begin;
-    count_of_cluster = dev.count_of_cluster;
-    dev.dev_img = INVALID_HANDLE_VALUE;
-    if (tmp == NULL || tmp == INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(tmp);
-    }
-    return *this;
-}
-
 dev_t::~dev_t()
 {
     if (dev_img != NULL && dev_img != INVALID_HANDLE_VALUE)
     {
+        clear();
         CloseHandle(dev_img);
     }
 }
@@ -213,34 +189,9 @@ dev_t::operator bool() const noexcept
     return (dev_img != NULL && dev_img != INVALID_HANDLE_VALUE);
 }
 
-uint16_t dev_t::get_block_size() const noexcept
-{
-    return BPB.BPB_BytsPerSec;
-}
-
-uint32_t dev_t::get_clus_size() const noexcept
-{
-    return clus_size;
-}
-
-uint32_t dev_t::get_count_of_clus() const noexcept
-{
-    return count_of_cluster;
-}
-
 uint32_t dev_t::get_root_clus() const noexcept
 {
     return BPB.BPB_RootClus;
-}
-
-uint8_t dev_t::get_sec_per_clus() const noexcept
-{
-    return BPB.BPB_SecPerClus;
-}
-
-uint32_t dev_t::get_total_block() const noexcept
-{
-    return BPB.BPB_TotSec32;
 }
 
 uint32_t dev_t::get_vol_id() const noexcept
@@ -250,7 +201,7 @@ uint32_t dev_t::get_vol_id() const noexcept
 
 uint32_t dev_t::get_fat(uint32_t fat_no) const
 {
-    return FAT_Table[fat_no & 0x0fffffff];
+    return FAT_Table[fat_no & 0x0fffffff] & 0x0fffffff;
 }
 
 void dev_t::set_fat(uint32_t fat_no, uint32_t value)
@@ -260,24 +211,24 @@ void dev_t::set_fat(uint32_t fat_no, uint32_t value)
 
 int32_t dev_t::read_block(uint32_t block_no, void *buf) const
 {
-    return dev_read(dev_img, block_no * get_block_size(), get_block_size(), buf);
+    return dev_read(dev_img, block_no * block_size, block_size, buf);
 }
 
 int32_t dev_t::write_block(uint32_t block_no, const void *buf) const
 {
-    return dev_write(dev_img, block_no * get_block_size(), get_block_size(), buf);
+    return dev_write(dev_img, block_no * block_size, block_size, buf);
 }
 
 int32_t dev_t::read_clus(uint32_t clus_no, void *buf) const
 {
     clus_no -= 2;
-    return dev_read(dev_img, (data_begin + get_sec_per_clus() * clus_no) * get_block_size(), get_sec_per_clus() * get_block_size(), buf);
+    return dev_read(dev_img, (data_begin + sec_per_clus * clus_no) * block_size, clus_size, buf);
 }
 
 int32_t dev_t::write_clus(uint32_t clus_no, const void *buf) const
 {
     clus_no -= 2;
-    return dev_write(dev_img, (data_begin + get_sec_per_clus() * clus_no) * get_block_size(), get_sec_per_clus() * get_block_size(), buf);
+    return dev_write(dev_img, (data_begin + sec_per_clus * clus_no) * block_size, clus_size, buf);
 }
 
 int32_t dev_t::dev_read(void *handle, uint64_t offset, uint32_t size,
@@ -336,8 +287,6 @@ void dev_t::format(uint32_t tot_block, uint16_t block_size)
 
 void dev_t::clac_info()
 {
-    memcpy(&BPB_Backup, &BPB, sizeof(fat32::BPB_t));
-    BPB_Backup.BPB_BkBootSec = 0;
     FAT_Table.resize(BPB.BPB_FATSz32 * BPB.BPB_BytsPerSec / sizeof(uint32_t));
     for (uint32_t i = 0; i < BPB.BPB_FATSz32; ++i)
     {
@@ -345,9 +294,44 @@ void dev_t::clac_info()
         dev_read(dev_img, (i + BPB.BPB_RsvdSecCnt) * BPB.BPB_BytsPerSec, BPB.BPB_BytsPerSec,
                  FAT_Table.data() + byte / sizeof(uint32_t));
     }
+    tot_block = BPB.BPB_TotSec32;
+    block_size = BPB.BPB_BytsPerSec;
+    sec_per_clus = BPB.BPB_SecPerClus;
+    clus_size = block_size * sec_per_clus;
     data_begin = BPB.BPB_RsvdSecCnt + BPB.BPB_NumFATs * BPB.BPB_FATSz32;
-    count_of_cluster = (BPB.BPB_TotSec32 - data_begin) / BPB.BPB_SecPerClus;
-    clus_size = BPB.BPB_BytsPerSec * BPB.BPB_SecPerClus;
+    count_of_cluster = (tot_block - data_begin) / sec_per_clus;
+    memset(&root_info, 0, sizeof(fat32::Entry_Info));
+    root_info.first_clus = get_root_clus();
+    root_info.info.dwFileAttributes = 0x10;
+    root_info.info.dwVolumeSerialNumber = get_vol_id();
+    ULARGE_INTEGER file_index;
+    file_index.QuadPart = get_root_clus();
+    root_info.info.nFileIndexHigh = file_index.HighPart;
+    root_info.info.nFileIndexLow = file_index.LowPart;
+    root_info.info.nNumberOfLinks = 2;
+    root = open_file(nullptr, &root_info);
+    open_file_table.insert((uint64_t)root.get());
+}
+
+void dev_t::clear()
+{
+    if (!cleared)
+    {
+        write_block(0, &BPB);
+        fat32::BPB_t BPB_Backup;
+        memcpy(&BPB_Backup, &BPB, sizeof(BPB));
+        BPB_Backup.BPB_BkBootSec = 0;
+        write_block(0, &BPB_Backup);
+        write_block(BPB.BPB_FSInfo, &FSInfo);
+        for (uint32_t i = 0; i < BPB.BPB_FATSz32; ++i)
+        {
+            write_block(i + BPB.BPB_RsvdSecCnt, FAT_Table.data() + i * block_size / sizeof(uint32_t));
+            write_block(i + BPB.BPB_RsvdSecCnt + BPB.BPB_FATSz32, FAT_Table.data() + i * block_size / sizeof(uint32_t));
+        }
+        save(root.get());
+        flush();
+        cleared = true;
+    }
 }
 
 } // namespace dev_io

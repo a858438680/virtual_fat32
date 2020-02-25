@@ -2,6 +2,9 @@
 #define FILE_H
 #include <vector>
 #include <string>
+#include <atomic>
+#include <map>
+#include <set>
 #include <memory>
 #include <stdexcept>
 #include <stdint.h>
@@ -82,25 +85,35 @@ struct LDIR_Entry
     wchar_t LDIR_Name3[2];
 } __attribute__((packed));
 
-struct Entry_Node
+struct Entry_Info
 {
     wchar_t name[256];
+    char short_name[11];
     uint32_t first_clus;
     BY_HANDLE_FILE_INFORMATION info;
+    bool isdir() const noexcept { return info.dwFileAttributes & 0x10; }
 };
 
 typedef std::vector<uint32_t> file_alloc;
 
-typedef std::vector<Entry_Node> dir_info;
+typedef std::vector<Entry_Info> dir_info;
 
 typedef std::vector<std::wstring> path;
 
-struct file
+struct file_ref
 {
+    uint64_t fd;
+};
+
+struct file_node
+{
+    file_node(file_node *parent) : parent(parent), ref_count(0) {}
     file_alloc alloc;
-    BY_HANDLE_FILE_INFORMATION info;
-    dir_info entries;
-    bool isdir() const noexcept { return info.dwFileAttributes & 0x10; }
+    Entry_Info info;
+    std::vector<DIR_Entry> entries;
+    file_node *parent;
+    std::map<std::wstring, std::unique_ptr<file_node>> children;
+    std::atomic<uint64_t> ref_count;
 };
 
 class file_error : public std::runtime_error
@@ -110,6 +123,8 @@ public:
     {
         FILE_NOT_FOUND,
         FILE_NOT_DIR,
+        FILE_ALREADY_EXISTS,
+        INVALID_FILE_DISCRIPTOR,
     };
     file_error(error_t err) noexcept : std::runtime_error(err_msg(err)), err(err) {}
     error_t get_error_type() const noexcept { return err; }
@@ -121,6 +136,8 @@ private:
             {
                 "file not found",
                 "file not dir",
+                "file already exists",
+                "invalid file discriptor",
             };
         return msg_table[static_cast<int>(err)];
     }

@@ -2,7 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stringapiset.h>
 #include "dokan_log.h"
+
+std::string wide2local(const wchar_t *s)
+{
+    int size = WideCharToMultiByte(CP_ACP, 0, s, -1, NULL, 0, NULL, FALSE);
+    std::string res;
+    res.resize(size);
+    size = WideCharToMultiByte(CP_ACP, 0, s, -1, res.data(), size, NULL, FALSE);
+    return std::move(res);
+}
 
 FILE *open_log_file(void)
 {
