@@ -61,7 +61,6 @@ public:
 
     uint64_t open(const fat32::path &path, uint32_t create_disposition, uint32_t file_attr, bool &exist, bool &isdir);
     uint64_t unlink(const fat32::path &path);
-    void stat(const fat32::path &path, LPBY_HANDLE_FILE_INFORMATION statbuf);
     void rename(const fat32::path &oldpath, const fat32::path &newpath);
     void mkdir(const fat32::path &path);
     void rmdir(const fat32::path &path);

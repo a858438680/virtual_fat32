@@ -37,19 +37,22 @@ void EntryInfo2DirEntry(fat32::Entry_Info *pinfo, fat32::DIR_Entry *pentry, int 
         auto len = (wcslen(pinfo->name) + 13 - 1) / 13;
         auto ldir = (fat32::LDIR_Entry *)pentry;
         pentry += len;
-        memcpy(pentry->DIR_Name, pinfo->short_name, sizeof(pinfo->short_name));
+        auto chksum = ChkSum((unsigned char *)pinfo->short_name);
+        memset(ldir, 0xff, len * sizeof(fat32::LDIR_Entry));
         for (size_t i = 0; i < len; ++i)
         {
             ldir[len - i - 1].LDIR_Ord = i + 1;
             memcpy(ldir[len - i - 1].LDIR_Name1, pinfo->name + index, sizeof(ldir[len - i - 1].LDIR_Name1));
             ldir[len - i - 1].LDIR_Attr = 0xf;
             ldir[len - i - 1].LDIR_Type = 0;
-            ldir[len - i - 1].LDIR_Chksum = ChkSum((unsigned char *)pentry->DIR_Name);
+            ldir[len - i - 1].LDIR_Chksum = chksum;
             memcpy(ldir[len - i - 1].LDIR_Name2, pinfo->name + index + 5, sizeof(ldir[len - i - 1].LDIR_Name2));
             ldir[len - i - 1].LDIR_FstClusLO = 0;
             memcpy(ldir[len - i - 1].LDIR_Name3, pinfo->name + index + 11, sizeof(ldir[len - i - 1].LDIR_Name3));
+            //need change to correctly implement padding and null termination
         }
         ldir[0].LDIR_Ord |= 0x40;
+        memcpy(pentry->DIR_Name, pinfo->short_name, sizeof(pinfo->short_name));
     }
     else
     {
@@ -72,14 +75,18 @@ void EntryInfo2DirEntry(fat32::Entry_Info *pinfo, fat32::DIR_Entry *pentry, int 
     int_tmp.LowPart = pinfo->info.nFileSizeLow;
     pentry->DIR_FileSize = int_tmp.QuadPart;
     SYSTEMTIME systime;
-    FileTimeToSystemTime(&pinfo->info.ftCreationTime, &systime);
+    FILETIME filetime;
+    FileTimeToLocalFileTime(&pinfo->info.ftCreationTime, &filetime);
+    FileTimeToSystemTime(&filetime, &systime);
     pentry->DIR_CrtDate = ((systime.wYear - 1980) << 9) + (systime.wMonth << 5) + systime.wDay;
     pentry->DIR_CrtTime = (systime.wHour << 11) + (systime.wMinute << 5) + (systime.wSecond / 2);
     pentry->DIR_CrtTimeTenth = (systime.wSecond % 2) * 100 + systime.wMilliseconds / 10;
-    FileTimeToSystemTime(&pinfo->info.ftLastWriteTime, &systime);
+    FileTimeToLocalFileTime(&pinfo->info.ftLastWriteTime, &filetime);
+    FileTimeToSystemTime(&filetime, &systime);
     pentry->DIR_WrtDate = ((systime.wYear - 1980) << 9) + (systime.wMonth << 5) + systime.wDay;
-    pentry->DIR_WrtDate = (systime.wHour << 11) + (systime.wMinute << 5) + (systime.wSecond / 2);
-    FileTimeToSystemTime(&pinfo->info.ftLastAccessTime, &systime);
+    pentry->DIR_WrtTime = (systime.wHour << 11) + (systime.wMinute << 5) + (systime.wSecond / 2);
+    FileTimeToLocalFileTime(&pinfo->info.ftLastAccessTime, &filetime);
+    FileTimeToSystemTime(&filetime, &systime);
     pentry->DIR_LstAccDate = ((systime.wYear - 1980) << 9) + (systime.wMonth << 5) + systime.wDay;
 }
 
@@ -251,10 +258,15 @@ uint64_t dev_t::open(const fat32::path &path, uint32_t create_disposition, uint3
                             info.info.dwFileAttributes = (file_attr & 0x37);
                             info.info.dwVolumeSerialNumber = get_vol_id();
                             SYSTEMTIME time;
-                            GetLocalTime(&time);
+                            GetSystemTime(&time);
                             SystemTimeToFileTime(&time, &info.info.ftCreationTime);
-                            SystemTimeToFileTime(&time, &info.info.ftLastAccessTime);
+                            time.wMilliseconds = 0;
+                            time.wSecond &= 0xfffffffe;
                             SystemTimeToFileTime(&time, &info.info.ftLastWriteTime);
+                            time.wHour = 0;
+                            time.wMinute = 0;
+                            time.wSecond = 0;
+                            SystemTimeToFileTime(&time, &info.info.ftLastAccessTime);
                             info.info.nFileIndexHigh = 0;
                             info.info.nFileIndexLow = 0;
                             info.info.nFileSizeHigh = 0;
@@ -362,7 +374,11 @@ uint32_t dev_t::read(uint64_t fd, int64_t offset, uint32_t len, void *buffer)
             index += size;
         }
         SYSTEMTIME time;
-        GetLocalTime(&time);
+        GetSystemTime(&time);
+        time.wMilliseconds = 0;
+        time.wHour = 0;
+        time.wMinute = 0;
+        time.wSecond = 0;
         SystemTimeToFileTime(&time, &p->info.info.ftLastAccessTime);
         return index;
     }
@@ -438,9 +454,14 @@ uint32_t dev_t::write(uint64_t fd, int64_t offset, uint32_t len, const void *buf
             p->info.info.nFileSizeLow = tmp.LowPart;
         }
         SYSTEMTIME time;
-        GetLocalTime(&time);
-        SystemTimeToFileTime(&time, &p->info.info.ftLastAccessTime);
+        GetSystemTime(&time);
+        time.wMilliseconds = 0;
+        time.wSecond &= 0xfffffffe;
         SystemTimeToFileTime(&time, &p->info.info.ftLastWriteTime);
+        time.wHour = 0;
+        time.wMinute = 0;
+        time.wSecond = 0;
+        SystemTimeToFileTime(&time, &p->info.info.ftLastAccessTime);
         return index;
     }
     else
@@ -805,6 +826,7 @@ int32_t dev_t::DirEntry2EntryInfo(fat32::DIR_Entry *pdir, fat32::Entry_Info *pin
     pinfo->info.dwFileAttributes = FatAttr2FileAttr(pdir[count].DIR_Attr);
     pinfo->info.dwVolumeSerialNumber = get_vol_id();
     SYSTEMTIME systime;
+    FILETIME filetime;
     memset(&systime, 0, sizeof(SYSTEMTIME));
     systime.wYear = (pdir[count].DIR_CrtDate >> 9) + 1980;
     systime.wMonth = ((pdir[count].DIR_CrtDate & 0x1e0) >> 5);
@@ -813,7 +835,8 @@ int32_t dev_t::DirEntry2EntryInfo(fat32::DIR_Entry *pdir, fat32::Entry_Info *pin
     systime.wMinute = ((pdir[count].DIR_CrtTime & 0x7e0) >> 5);
     systime.wSecond = (pdir[count].DIR_CrtTime & 0x1f) * 2 + pdir[count].DIR_CrtTimeTenth / 100;
     systime.wMilliseconds = (pdir[count].DIR_CrtTimeTenth % 100) * 10;
-    SystemTimeToFileTime(&systime, &pinfo->info.ftCreationTime);
+    SystemTimeToFileTime(&systime, &filetime);
+    LocalFileTimeToFileTime(&filetime, &pinfo->info.ftCreationTime);
     memset(&systime, 0, sizeof(SYSTEMTIME));
     systime.wYear = (pdir[count].DIR_WrtDate >> 9) + 1980;
     systime.wMonth = ((pdir[count].DIR_WrtDate & 0x1e0) >> 5);
@@ -821,12 +844,14 @@ int32_t dev_t::DirEntry2EntryInfo(fat32::DIR_Entry *pdir, fat32::Entry_Info *pin
     systime.wHour = (pdir[count].DIR_WrtTime >> 11);
     systime.wMinute = ((pdir[count].DIR_WrtTime & 0x7e0) >> 5);
     systime.wSecond = (pdir[count].DIR_WrtTime & 0x1f) * 2;
-    SystemTimeToFileTime(&systime, &pinfo->info.ftLastWriteTime);
+    SystemTimeToFileTime(&systime, &filetime);
+    LocalFileTimeToFileTime(&filetime, &pinfo->info.ftLastWriteTime);
     memset(&systime, 0, sizeof(SYSTEMTIME));
     systime.wYear = (pdir[count].DIR_LstAccDate >> 9) + 1980;
     systime.wMonth = ((pdir[count].DIR_LstAccDate & 0x1e0) >> 5);
     systime.wDay = (pdir[count].DIR_LstAccDate & 0x1f);
-    SystemTimeToFileTime(&systime, &pinfo->info.ftLastAccessTime);
+    SystemTimeToFileTime(&systime, &filetime);
+    LocalFileTimeToFileTime(&filetime, &pinfo->info.ftLastAccessTime);
     ULARGE_INTEGER file_index;
     file_index.QuadPart = pinfo->first_clus;
     pinfo->info.nFileIndexHigh = file_index.HighPart;
