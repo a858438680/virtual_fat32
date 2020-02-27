@@ -22,7 +22,7 @@ void print_help(char *argv0)
         "                             can be 512, 1024, 2048 or 4096\n"
         "  -h, --help                 show help messages\n"
         "The FILESIZE argument is an integer and a unit.\n"
-        "Units are MiB, GiB (powers of 1024) or KB,MB,... (powers of 1000).\n",
+        "Units are MiB,GiB (powers of 1024) or MB,GB (powers of 1000).\n",
         argv0);
 }
 

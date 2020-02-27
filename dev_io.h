@@ -69,7 +69,13 @@ public:
     uint32_t read(uint64_t fd, int64_t offset, uint32_t len, void *buf);
     uint32_t write(uint64_t fd, int64_t offset, uint32_t len, const void *buf);
     void fstat(uint64_t fd, LPBY_HANDLE_FILE_INFORMATION statbuf);
+    void setattr(uint64_t fd, uint32_t attr);
+    void settime(uint64_t fd, CONST FILETIME *CreationTime, CONST FILETIME *LastAccessTime, CONST FILETIME *LastWriteTime);
+    void setend(uint64_t fd, int64_t offset);
+    void setalloc(uint64_t fd, int64_t alloc);
+
     fat32::dir_info opendir(uint64_t fd);
+    void get_disk_info(uint64_t *free_avilable, uint64_t *tot_size, uint64_t *tot_free);
     void flush();
     void clear();
 
@@ -95,9 +101,10 @@ private:
     void free_clus(uint32_t clus_no);
     void extend(fat32::file_node *node, uint32_t clus_count);
     void shrink(fat32::file_node *node, uint32_t clus_count);
-    void add_entry(fat32::file_node *node, fat32::Entry_Info *pinfo);
+    void add_entry(fat32::file_node *node, fat32::Entry_Info *pinfo, int have_long, bool replace);
     void remove_entry(fat32::file_node *node, std::wstring_view name);
-    int32_t DirEntry2EntryInfo(fat32::DIR_Entry *pdir, fat32::Entry_Info *pinfo);
+    void gen_short(std::wstring_view name, const std::vector<fat32::DIR_Entry> &entries, char *short_name);
+    int32_t DirEntry2EntryInfo(const fat32::DIR_Entry *pdir, fat32::Entry_Info *pinfo);
 
     void *dev_img;
     fat32::BPB_t BPB;
