@@ -38,7 +38,13 @@ void EntryInfo2DirEntry(fat32::Entry_Info *pinfo, fat32::DIR_Entry *pentry, int 
     if (have_long)
     {
         size_t index = 0;
-        auto len = (wcslen(pinfo->name) + 13 - 1) / 13;
+        auto name_len = wcslen(pinfo->name);
+        auto len = (name_len + 13 - 1) / 13;
+        auto padding_len = (len * 13 < 256 ? len * 13 : 256) - name_len;
+        if (padding_len > 1)
+        {
+            memset(pinfo->name + name_len + 1, 0xff, (padding_len - 1) * sizeof(wchar_t));
+        }
         auto ldir = (fat32::LDIR_Entry *)pentry;
         pentry += len;
         auto chksum = ChkSum((unsigned char *)pinfo->short_name);
@@ -53,7 +59,7 @@ void EntryInfo2DirEntry(fat32::Entry_Info *pinfo, fat32::DIR_Entry *pentry, int 
             memcpy(ldir[len - i - 1].LDIR_Name2, pinfo->name + index + 5, sizeof(ldir[len - i - 1].LDIR_Name2));
             ldir[len - i - 1].LDIR_FstClusLO = 0;
             memcpy(ldir[len - i - 1].LDIR_Name3, pinfo->name + index + 11, sizeof(ldir[len - i - 1].LDIR_Name3));
-            //need change to correctly implement padding and null termination
+            index += 13;
         }
         ldir[0].LDIR_Ord |= 0x40;
     }
@@ -81,7 +87,7 @@ void EntryInfo2DirEntry(fat32::Entry_Info *pinfo, fat32::DIR_Entry *pentry, int 
     pentry->DIR_LstAccDate = ((systime.wYear - 1980) << 9) + (systime.wMonth << 5) + systime.wDay;
 }
 
-void dev_t::gen_short(std::wstring_view name, const std::vector<fat32::DIR_Entry> &entries, char *short_name)
+void dev_t::gen_short(std::wstring_view name, fat32::file_node *node, char *short_name)
 {
     char name_tmp[11];
     memset(name_tmp, 0x20, sizeof(name_tmp));
@@ -200,20 +206,14 @@ void dev_t::gen_short(std::wstring_view name, const std::vector<fat32::DIR_Entry
         fat32::Entry_Info info;
         int ret;
         size_t entry_index = 0;
-        while (entry_index < entries.size() && (ret = DirEntry2EntryInfo(entries.data() + entry_index, &info)))
+        auto dir_entries = opendir((uint64_t)node);
+        for (const auto &e: dir_entries)
         {
-            if (ret < 0)
+            if (memcmp(name_tmp, e.short_name, sizeof(name_tmp)) == 0 && name != e.name)
             {
-                entry_index -= ret;
-            }
-            else
-            {
-                if (memcmp(name_tmp, info.short_name, sizeof(name_tmp)) == 0)
-                {
-                    ++dup;
-                    ok = false;
-                }
-                entry_index += ret;
+                ++dup;
+                ok = false;
+                break;
             }
         }
     } while (!ok);
@@ -286,7 +286,7 @@ uint64_t dev_t::open(const fat32::path &path, uint32_t create_disposition, uint3
                             isdir = file_attr & 0x10;
                             fat32::Entry_Info info;
                             wcscpy(info.name, name.c_str());
-                            gen_short(name, last->entries, info.short_name);
+                            gen_short(name, last, info.short_name);
                             info.first_clus = 0;
                             info.info.dwFileAttributes = (file_attr & 0x37);
                             info.info.dwVolumeSerialNumber = get_vol_id();
@@ -361,20 +361,81 @@ uint64_t dev_t::open(const fat32::path &path, uint32_t create_disposition, uint3
     return 0;
 }
 
-uint64_t dev_t::unlink(const fat32::path &path) { return 0; }
+void dev_t::unlink(uint64_t fd)
+{
+    cleared = false;
+    if (open_file_table.find(fd) != open_file_table.end())
+    {
+        auto p = (fat32::file_node *)fd;
+        p->delete_on_close = true;
+    }
+    else
+    {
+        throw fat32::file_error(fat32::file_error::INVALID_FILE_DISCRIPTOR);
+    }
+}
 
-void dev_t::rename(const fat32::path &oldpath, const fat32::path &newpath) {}
-
-void dev_t::mkdir(const fat32::path &path) {}
-
-void dev_t::rmdir(const fat32::path &path) {}
+bool dev_t::rename(uint64_t fd, const fat32::path &newpath, bool replace)
+{
+    if (newpath.empty())
+        return false;
+    cleared = false;
+    if (open_file_table.find(fd) != open_file_table.end())
+    {
+        auto p = (fat32::file_node *)fd;
+        if (!p->parent)
+            return false;
+        auto copy = newpath;
+        copy.pop_back();
+        bool exist;
+        bool isdir;
+        auto file = open(copy, OPEN_EXISTING, 0, exist, isdir);
+        auto new_parent = (fat32::file_node *)file;
+        auto ret = opendir((uint64_t)new_parent);
+        for (const auto &e : ret)
+        {
+            if (newpath.back() == e.name)
+            {
+                if (((e.info.dwFileAttributes & 0x10) && !(p->info.info.dwFileAttributes & 0x10)) ||
+                    (!(e.info.dwFileAttributes & 0x10) && (p->info.info.dwFileAttributes & 0x10)))
+                {
+                    return false;
+                }
+                else if (replace)
+                {
+                    break;
+                }
+                else
+                {
+                    close((uint64_t)new_parent);
+                    return true;
+                }
+            }
+        }
+        auto origin_parent = p->parent;
+        auto itr = origin_parent->children.find(p->info.name);
+        auto ptr = std::move(itr->second);
+        origin_parent->children.erase(itr);
+        remove_entry(origin_parent, p->info.name);
+        p->parent = new_parent;
+        wcscpy(p->info.name, newpath.back().c_str());
+        gen_short(newpath.back(), new_parent, p->info.short_name);
+        new_parent->children.insert(std::make_pair(std::wstring(p->info.name), std::move(ptr)));
+        close((uint64_t)new_parent);
+        return true;
+    }
+    else
+    {
+        throw fat32::file_error(fat32::file_error::INVALID_FILE_DISCRIPTOR);
+    }
+}
 
 void dev_t::close(uint64_t fd)
 {
     if (open_file_table.find(fd) != open_file_table.end())
     {
         auto p = (fat32::file_node *)fd;
-        auto ref = p->ref_count.fetch_sub(std::memory_order_acquire);
+        p->ref_count.fetch_sub(1, std::memory_order_acquire);
         clear_node(p);
     }
     else
@@ -551,18 +612,14 @@ void dev_t::settime(uint64_t fd, CONST FILETIME *CreationTime, CONST FILETIME *L
     {
         auto p = (fat32::file_node *)fd;
         SYSTEMTIME systime;
-        FILETIME filetime;
-        FileTimeToLocalFileTime(CreationTime, &filetime);
-        FileTimeToSystemTime(&filetime, &systime);
+        FileTimeToSystemTime(CreationTime, &systime);
         systime.wMilliseconds = systime.wMilliseconds / 10 * 10;
         SystemTimeToFileTime(&systime, &p->info.info.ftCreationTime);
-        FileTimeToLocalFileTime(LastWriteTime, &filetime);
-        FileTimeToSystemTime(&filetime, &systime);
+        FileTimeToSystemTime(LastWriteTime, &systime);
         systime.wMilliseconds = 0;
         systime.wSecond &= 0xfffffffe;
         SystemTimeToFileTime(&systime, &p->info.info.ftLastWriteTime);
-        FileTimeToLocalFileTime(LastAccessTime, &filetime);
-        FileTimeToSystemTime(&filetime, &systime);
+        FileTimeToSystemTime(LastAccessTime, &systime);
         systime.wMilliseconds = 0;
         systime.wSecond = 0;
         systime.wMinute = 0;
@@ -649,6 +706,18 @@ fat32::dir_info dev_t::opendir(uint64_t fd)
         {
             throw fat32::file_error(fat32::file_error::FILE_NOT_DIR);
         }
+        if (p->parent)
+        {
+            fat32::Entry_Info tmp_info;
+            memcpy(&tmp_info, &p->info, sizeof(fat32::Entry_Info));
+            wcscpy(tmp_info.name, L".");
+            memcpy(tmp_info.short_name, this_folder, sizeof(this_folder));
+            add_entry(p, &tmp_info, 0, true);
+            memcpy(&tmp_info, &p->parent->info, sizeof(fat32::Entry_Info));
+            wcscpy(tmp_info.name, L"..");
+            memcpy(tmp_info.short_name, parent_folder, sizeof(parent_folder));
+            add_entry(p, &tmp_info, 0, true);
+        }
         for (const auto &c : p->children)
         {
             add_entry(p, &c.second->info, 1, true);
@@ -709,6 +778,7 @@ std::unique_ptr<fat32::file_node> dev_t::open_file(fat32::file_node *parent, fat
             count += clus_size / sizeof(fat32::DIR_Entry);
         }
     }
+    res->delete_on_close = false;
     return std::move(res);
 }
 
@@ -752,35 +822,51 @@ void dev_t::clear_node(fat32::file_node *node)
 {
     if (!node->ref_count.load(std::memory_order_acquire) && node->children.empty())
     {
-        if (node->info.info.dwFileAttributes & 0x10)
+        if (node->delete_on_close)
         {
             if (node->parent)
             {
-                fat32::Entry_Info tmp_info;
-                memcpy(&tmp_info, &node->info, sizeof(fat32::Entry_Info));
-                wcscpy(tmp_info.name, L".");
-                memcpy(tmp_info.short_name, this_folder, sizeof(this_folder));
-                add_entry(node, &tmp_info, 0, true);
-                memcpy(&tmp_info, &node->parent->info, sizeof(fat32::Entry_Info));
-                wcscpy(tmp_info.name, L"..");
-                memcpy(tmp_info.short_name, parent_folder, sizeof(parent_folder));
-                add_entry(node, &tmp_info, 0, true);
-            }
-            size_t index = 0;
-            for (auto clus : node->alloc)
-            {
-                write_clus(clus, node->entries.data() + index * (clus_size / sizeof(fat32::DIR_Entry)));
-                ++index;
+                std::wstring name = node->info.name;
+                auto parent = node->parent;
+                shrink(node, 0);
+                open_file_table.erase((uint64_t)node);
+                parent->children.erase(name);
+                remove_entry(parent, name);
+                clear_node(parent);
             }
         }
-        if (node->parent)
+        else
         {
-            std::wstring name = node->info.name;
-            auto parent = node->parent;
-            add_entry(parent, &node->info, 1, true);
-            open_file_table.erase((uint64_t)node);
-            parent->children.erase(name);
-            clear_node(parent);
+            if (node->info.info.dwFileAttributes & 0x10)
+            {
+                if (node->parent)
+                {
+                    fat32::Entry_Info tmp_info;
+                    memcpy(&tmp_info, &node->info, sizeof(fat32::Entry_Info));
+                    wcscpy(tmp_info.name, L".");
+                    memcpy(tmp_info.short_name, this_folder, sizeof(this_folder));
+                    add_entry(node, &tmp_info, 0, true);
+                    memcpy(&tmp_info, &node->parent->info, sizeof(fat32::Entry_Info));
+                    wcscpy(tmp_info.name, L"..");
+                    memcpy(tmp_info.short_name, parent_folder, sizeof(parent_folder));
+                    add_entry(node, &tmp_info, 0, true);
+                }
+                size_t index = 0;
+                for (auto clus : node->alloc)
+                {
+                    write_clus(clus, node->entries.data() + index * (clus_size / sizeof(fat32::DIR_Entry)));
+                    ++index;
+                }
+            }
+            if (node->parent)
+            {
+                std::wstring name = node->info.name;
+                auto parent = node->parent;
+                add_entry(parent, &node->info, 1, true);
+                open_file_table.erase((uint64_t)node);
+                parent->children.erase(name);
+                clear_node(parent);
+            }
         }
     }
 }
@@ -858,6 +944,8 @@ void dev_t::add_entry(fat32::file_node *node, fat32::Entry_Info *pinfo, int have
 {
     log_msg("add_entry: %s\n", wide2local(pinfo->name).c_str());
     log_pointer("    ", pinfo);
+    log_int32("    ", have_long);
+    log_bool("    ", replace);
     size_t entry_len = 1;
     if (have_long)
     {
@@ -928,9 +1016,16 @@ void dev_t::remove_entry(fat32::file_node *node, std::wstring_view name)
         {
             if (buf.name == name)
             {
-                for (size_t i = index; i < index + ret; ++i)
+                if (*(uint8_t *)node->entries[index + ret].DIR_Name == 0)
                 {
-                    *(uint8_t *)node->entries[i].DIR_Name = 0xe5;
+                    memset(&node->entries[index], 0, ret * sizeof(fat32::DIR_Entry));
+                }
+                else
+                {
+                    for (size_t i = index; i < index + ret; ++i)
+                    {
+                        *(uint8_t *)node->entries[i].DIR_Name = 0xe5;
+                    }
                 }
                 return;
             }

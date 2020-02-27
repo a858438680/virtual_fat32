@@ -60,10 +60,8 @@ public:
     operator bool() const noexcept;
 
     uint64_t open(const fat32::path &path, uint32_t create_disposition, uint32_t file_attr, bool &exist, bool &isdir);
-    uint64_t unlink(const fat32::path &path);
-    void rename(const fat32::path &oldpath, const fat32::path &newpath);
-    void mkdir(const fat32::path &path);
-    void rmdir(const fat32::path &path);
+    void unlink(uint64_t fd);
+    bool rename(uint64_t fd, const fat32::path &newpath, bool replace);
     fat32::dir_info opendir(const fat32::path &path);
     void close(uint64_t fd);
     uint32_t read(uint64_t fd, int64_t offset, uint32_t len, void *buf);
@@ -103,7 +101,7 @@ private:
     void shrink(fat32::file_node *node, uint32_t clus_count);
     void add_entry(fat32::file_node *node, fat32::Entry_Info *pinfo, int have_long, bool replace);
     void remove_entry(fat32::file_node *node, std::wstring_view name);
-    void gen_short(std::wstring_view name, const std::vector<fat32::DIR_Entry> &entries, char *short_name);
+    void gen_short(std::wstring_view name, fat32::file_node *node, char *short_name);
     int32_t DirEntry2EntryInfo(const fat32::DIR_Entry *pdir, fat32::Entry_Info *pinfo);
 
     void *dev_img;

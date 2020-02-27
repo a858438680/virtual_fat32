@@ -19,6 +19,8 @@
 
 #define log_uint64(indent, name) log_msg(indent #name " = 0x%016x\n", name)
 
+#define log_bool(indent, name) log_msg(indent #name " = %s\n", name ? "true" : "false");
+
 #define log_pointer(indent, name) log_msg(indent #name " = %p\n", name)
 
 #define log_pdokan_file_info(indent, name)                         \
@@ -110,6 +112,66 @@
         log_pdokan_file_info("    ", DokanFileInfo); \
     } while (0)
 
+#define LOG_SetFileAttributes()                      \
+    do                                               \
+    {                                                \
+        log_msg("SetFileAttributes:\n");             \
+        log_wstring("    ", FileName);               \
+        log_uint32("    ", FileAttributes);          \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_SetFileTime()                            \
+    do                                               \
+    {                                                \
+        log_msg("SetFileTime:\n");                   \
+        log_wstring("    ", FileName);               \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_DeleteFile()                             \
+    do                                               \
+    {                                                \
+        log_msg("DeleteFile:\n");                    \
+        log_wstring("    ", FileName);               \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_DeleteDirectory()                        \
+    do                                               \
+    {                                                \
+        log_msg("DeleteDirectory:\n");               \
+        log_wstring("    ", FileName);               \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_MoveFile()                               \
+    do                                               \
+    {                                                \
+        log_msg("MoveFile:\n");                      \
+        log_wstring("    ", FileName);               \
+        log_wstring("    ", NewFileName);            \
+        log_bool("    ", ReplaceIfExisting);         \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_SetEndOfFile()                           \
+    do                                               \
+    {                                                \
+        log_msg("SetEndOfFile:\n");                  \
+        log_wstring("    ", FileName);               \
+        log_int64("    ", ByteOffset);               \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
+
+#define LOG_SetAllocationSize()                           \
+    do                                               \
+    {                                                \
+        log_msg("SetAllocationSize:\n");                  \
+        log_wstring("    ", FileName);               \
+        log_int64("    ", AllocSize);               \
+        log_pdokan_file_info("    ", DokanFileInfo); \
+    } while (0)
 
 std::string wide2local(const wchar_t *s);
 

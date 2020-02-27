@@ -114,6 +114,7 @@ struct file_node
     file_node *parent;
     std::map<std::wstring, std::unique_ptr<file_node>> children;
     std::atomic<uint64_t> ref_count;
+    bool delete_on_close;
 };
 
 class file_error : public std::runtime_error
